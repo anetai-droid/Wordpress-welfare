@@ -1,0 +1,8 @@
+services:
+  tech-digest:
+    build: .
+    env_file:
+      - .env
+    restart: "no"
+    volumes:
+      - ./output:/app/output

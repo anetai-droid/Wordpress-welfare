@@ -1,305 +1,306 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+福祉・介護ニュースダイジェスト → WordPress自動投稿
+  - RSS取得 : Google ニュース（介護 / 福祉 / 助成金）
+  - AI生成  : Ollama (Gemma) ← ngrok 経由で requests 送信
+  - 投稿先  : WordPress REST API（下書き保存）
+  - 重複管理: SQLite
+"""
+
 import os
-import base64
-import datetime
 import sqlite3
-import feedparser
 import requests
+import feedparser
+import base64
+import time
+from datetime import datetime
 from pathlib import Path
-from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CHATWORK_API_TOKEN = os.getenv("CHATWORK_API_TOKEN")
-CHATWORK_ROOM_ID = os.getenv("CHATWORK_ROOM_ID")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+# ── 設定 ────────────────────────────────────────────────────────────────────
+OLLAMA_NGROK_URL = os.getenv("OLLAMA_NGROK_URL", "http://localhost:11434")
+OLLAMA_MODEL     = os.getenv("OLLAMA_MODEL", "gemma2:9b")
 
-DB_PATH = Path("output/history.db")
+WP_URL          = os.getenv("WP_URL", "")
+WP_USERNAME     = os.getenv("WP_USERNAME", "")
+WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
+
+DB_PATH = Path(__file__).parent / "output" / "history.db"
+
+MAX_ARTICLES_PER_FEED = 3   # 1フィードあたりの最大処理件数
+AI_TIMEOUT            = 120  # Ollamaリクエストのタイムアウト（秒）
+WP_TIMEOUT            = 30   # WordPress APIのタイムアウト（秒）
+
+# ── RSSフィード一覧（Google ニュース）──────────────────────────────────────
+RSS_FEEDS = [
+    {
+        "name": "介護ニュース",
+        "url": "https://news.google.com/rss/search?q=介護+事業所&hl=ja&gl=JP&ceid=JP:ja",
+        "category": "介護",
+    },
+    {
+        "name": "福祉ニュース",
+        "url": "https://news.google.com/rss/search?q=福祉+事業所&hl=ja&gl=JP&ceid=JP:ja",
+        "category": "福祉",
+    },
+    {
+        "name": "助成金ニュース",
+        "url": "https://news.google.com/rss/search?q=福祉+介護+助成金&hl=ja&gl=JP&ceid=JP:ja",
+        "category": "助成金",
+    },
+]
 
 
-# ─────────────────────────────────────────────
-# 状態管理（SQLite による重複送信防止）
-# ─────────────────────────────────────────────
-
-def init_db():
-    """DBとテーブルを初期化する（存在しない場合のみ作成）"""
+# ── データベース（重複送信防止）───────────────────────────────────────────
+def init_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS sent_items (
-                url TEXT PRIMARY KEY,
+                url     TEXT PRIMARY KEY,
                 sent_at TEXT NOT NULL
             )
         """)
 
 
 def is_sent(url: str) -> bool:
-    """URLがすでに送信済みか確認する"""
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT 1 FROM sent_items WHERE url = ?", (url,)).fetchone()
+        row = conn.execute(
+            "SELECT 1 FROM sent_items WHERE url = ?", (url,)
+        ).fetchone()
         return row is not None
 
 
-def mark_sent(url: str):
-    """URLを送信済みとして記録する"""
-    sent_at = datetime.datetime.now().isoformat()
+def mark_sent(url: str) -> None:
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT INTO sent_items (url, sent_at) VALUES (?, ?)", (url, sent_at))
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-
-# ─────────────────────────────────────────────
-# Step 1: RSS ニュース取得 & 要約
-# ─────────────────────────────────────────────
-
-RSS_FEEDS = [
-    ("Zenn", "https://zenn.dev/feed"),
-    ("Qiita", "https://qiita.com/popular-items/feed"),
-    ("TechCrunch(US)", "https://techcrunch.com/feed/"),
-]
+        conn.execute(
+            "INSERT OR IGNORE INTO sent_items (url, sent_at) VALUES (?, ?)",
+            (url, datetime.now().isoformat()),
+        )
 
 
-def fetch_top_article(name: str, url: str) -> dict | None:
-    """RSSフィードから最新1件を取得する"""
+# ── RSS取得 ──────────────────────────────────────────────────────────────────
+def fetch_articles(feed: dict) -> list[dict]:
+    """RSSフィードから未送信の記事を最大 MAX_ARTICLES_PER_FEED 件返す"""
     try:
-        feed = feedparser.parse(url)
-        if not feed.entries:
-            print(f"[WARN] {name}: エントリなし")
+        parsed = feedparser.parse(feed["url"])
+    except Exception as e:
+        print(f"  [RSS] {feed['name']} 取得エラー: {e}")
+        return []
+
+    articles = []
+    for entry in parsed.entries:
+        if len(articles) >= MAX_ARTICLES_PER_FEED:
+            break
+        url = entry.get("link", "")
+        if not url or is_sent(url):
+            continue
+        articles.append({
+            "title"    : entry.get("title", "（タイトルなし）"),
+            "url"      : url,
+            "summary"  : entry.get("summary", entry.get("description", "")),
+            "published": entry.get("published", ""),
+            "category" : feed["category"],
+        })
+
+    print(f"  [RSS] {feed['name']}: {len(articles)} 件取得")
+    return articles
+
+
+# ── Ollama (Gemma) によるブログ記事生成 ──────────────────────────────────────
+
+SYSTEM_PROMPT = """あなたは福祉・介護業界の専門ライターです。
+福祉事業所・介護事業所のスタッフや管理者が読む、専門的でわかりやすいブログ記事を執筆します。
+文体は「です・ます」調の丁寧な日本語を使用してください。
+
+記事は必ず以下のHTML構成で出力してください（Markdownは使わないこと）。
+
+<title>（目を引く、具体的な記事タイトル）</title>
+
+<p>（導入文：なぜこのニュースが現場で重要なのか、背景を2〜3文で説明）</p>
+
+<h2>ニュースの要点</h2>
+<p>（詳細な解説を2〜3段落。数値や制度名があれば必ず明記する）</p>
+
+<h2>現場への影響と活用ポイント</h2>
+<ul>
+  <li>（具体的な実務への影響や対応策）</li>
+  <li>（スタッフや管理者が意識すべき注意点）</li>
+  <li>（すぐに活かせる実践的なヒント）</li>
+</ul>
+
+<h2>まとめ</h2>
+<p>（今後の展望と読者へのメッセージを1〜2段落）</p>
+"""
+
+
+def generate_article(article: dict) -> dict | None:
+    """Ollama (Gemma) でブログ記事HTMLを生成し、タイトルと本文を返す"""
+    user_prompt = (
+        f"以下のニュース記事を元に、福祉・介護事業所のスタッフ向けブログ記事を作成してください。\n\n"
+        f"【ニュースタイトル】\n{article['title']}\n\n"
+        f"【ニュース概要】\n{article['summary'][:1500] or '（概要なし）'}\n\n"
+        f"【元記事URL】\n{article['url']}\n\n"
+        f"【カテゴリ】\n{article['category']}\n\n"
+        "現場で働くスタッフが実務に直結した気づきを得られる内容にしてください。"
+    )
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.7,
+            "num_predict": 2048,
+        },
+    }
+
+    endpoint = f"{OLLAMA_NGROK_URL.rstrip('/')}/api/chat"
+
+    try:
+        print(f"    [AI] POST → {endpoint}")
+        print(f"    [AI] 記事生成中: {article['title'][:50]}...")
+        resp = requests.post(endpoint, json=payload, timeout=AI_TIMEOUT)
+        print(f"    [AI] HTTP status: {resp.status_code}")
+        resp.raise_for_status()
+        content = resp.json().get("message", {}).get("content", "").strip()
+
+        if not content:
+            print("    [AI] レスポンスが空でした")
+            print(f"    [AI] Raw response: {resp.text[:300]}")
             return None
-        entry = feed.entries[0]
+
+        # <title>タグからWordPress投稿タイトルを抽出
+        wp_title = article["title"]  # デフォルトはRSSタイトル
+        if "<title>" in content and "</title>" in content:
+            t_start = content.index("<title>") + len("<title>")
+            t_end   = content.index("</title>")
+            wp_title = content[t_start:t_end].strip()
+            content  = (content[:content.index("<title>")] + content[t_end + len("</title>"):]).strip()
+
+        # 出典リンクを末尾に追加
+        content += (
+            f'\n<p><small>出典: <a href="{article["url"]}" '
+            f'target="_blank" rel="noopener noreferrer">'
+            f'{article["title"]}</a></small></p>'
+        )
+
         return {
-            "source": name,
-            "title": entry.get("title", "(タイトルなし)"),
-            "link": entry.get("link", ""),
-            "summary": entry.get("summary", entry.get("description", "")),
+            "title"     : wp_title,
+            "content"   : content,
+            "category"  : article["category"],
+            "source_url": article["url"],
         }
-    except Exception as e:
-        print(f"[ERROR] {name} RSS取得失敗: {e}")
+
+    except requests.exceptions.Timeout:
+        print(f"    [AI] タイムアウト（{AI_TIMEOUT}秒超過）")
+        return None
+    except requests.exceptions.HTTPError as e:
+        print(f"    [AI] HTTPエラー: {e}")
+        print(f"    [AI] Response body: {resp.text[:500]}")
+        return None
+    except requests.exceptions.RequestException as e:
+        print(f"    [AI] リクエストエラー: {e}")
         return None
 
 
-def summarize_article(article: dict) -> str:
-    """OpenAI API で記事を日本語要約する"""
-    prompt = (
-        "以下の技術記事の内容を日本語で簡潔に要約してください。\n"
-        "必ず以下のフォーマットで出力してください。\n\n"
-        "【コア技術・課題】: \n"
-        "【結論・知見】: \n\n"
-        f"タイトル: {article['title']}\n"
-        f"本文（抜粋）: {article['summary'][:2000]}"
-    )
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=400,
-            temperature=0.3,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[ERROR] OpenAI 要約失敗 ({article['source']}): {e}")
-        return "（要約取得に失敗しました）"
+# ── WordPress 投稿 ───────────────────────────────────────────────────────────
+def post_to_wordpress(generated: dict) -> bool:
+    """生成した記事をWordPressに「下書き」として投稿する"""
+    if not all([WP_URL, WP_USERNAME, WP_APP_PASSWORD]):
+        print("    [WP] .env の WordPress設定が不足しています")
+        return False
 
+    token = base64.b64encode(
+        f"{WP_USERNAME}:{WP_APP_PASSWORD}".encode("utf-8")
+    ).decode("utf-8")
 
-def collect_news_summaries() -> list[dict]:
-    results = []
-    for name, url in RSS_FEEDS:
-        article = fetch_top_article(name, url)
-        if article is None:
-            continue
-        link = article["link"]
-        if is_sent(link):
-            print(f"[SKIP] {name}: 送信済みのためスキップ ({link})")
-            continue
-        article["ai_summary"] = summarize_article(article)
-        mark_sent(link)
-        results.append(article)
-    return results
-
-
-# ─────────────────────────────────────────────
-# Step 2: GitHub トレンドリポジトリ取得 & 解析
-# ─────────────────────────────────────────────
-
-def fetch_trending_repo() -> dict | None:
-    """直近7日以内に作成されスター数が多いリポジトリを1件取得する"""
-    since = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
-    params = {
-        "q": f"created:>{since}",
-        "sort": "stars",
-        "order": "desc",
-        "per_page": 1,
-    }
-    headers = {"Accept": "application/vnd.github+json"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-
-    try:
-        resp = requests.get(
-            "https://api.github.com/search/repositories",
-            params=params,
-            headers=headers,
-            timeout=15,
-        )
-        resp.raise_for_status()
-        items = resp.json().get("items", [])
-        if not items:
-            print("[WARN] GitHub: リポジトリが見つかりませんでした")
-            return None
-        return items[0]
-    except Exception as e:
-        print(f"[ERROR] GitHub検索失敗: {e}")
-        return None
-
-
-def fetch_readme(repo: dict) -> str:
-    """リポジトリのREADME.mdを取得してデコードする（先頭3000文字）"""
-    owner = repo["owner"]["login"]
-    name = repo["name"]
-    headers = {"Accept": "application/vnd.github+json"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-
-    try:
-        resp = requests.get(
-            f"https://api.github.com/repos/{owner}/{name}/readme",
-            headers=headers,
-            timeout=15,
-        )
-        if resp.status_code == 404:
-            return "(README.mdが存在しません)"
-        resp.raise_for_status()
-        content_b64 = resp.json().get("content", "")
-        decoded = base64.b64decode(content_b64).decode("utf-8", errors="replace")
-        return decoded[:3000]
-    except Exception as e:
-        print(f"[ERROR] README取得失敗: {e}")
-        return "(README取得に失敗しました)"
-
-
-def analyze_repo(repo: dict, readme_text: str) -> str:
-    """OpenAI API でリポジトリを日本語解析する"""
-    prompt = (
-        "以下のGitHubリポジトリのREADMEを読み、日本語で解析してください。\n"
-        "必ず以下のフォーマットで出力してください。\n\n"
-        "【リポジトリ名】: \n"
-        "【どんなプログラムか】: (1〜2行で簡潔に)\n"
-        "【技術的な構成・アーキテクチャ】: (どういう仕組みで動いているか)\n"
-        "【使用技術・ライブラリ】: (言語、フレームワーク、主要な依存関係など)\n\n"
-        f"リポジトリ名: {repo['full_name']}\n"
-        f"説明: {repo.get('description', '(なし)')}\n"
-        f"README:\n{readme_text}"
-    )
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=600,
-            temperature=0.3,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print(f"[ERROR] OpenAI 解析失敗: {e}")
-        return "（解析取得に失敗しました）"
-
-
-def collect_github_analysis() -> dict | None:
-    repo = fetch_trending_repo()
-    if repo is None:
-        return None
-    repo_url = repo["html_url"]
-    if is_sent(repo_url):
-        print(f"[SKIP] GitHub: 送信済みのためスキップ ({repo_url})")
-        return None
-    readme = fetch_readme(repo)
-    analysis = analyze_repo(repo, readme)
-    mark_sent(repo_url)
-    return {
-        "full_name": repo["full_name"],
-        "url": repo_url,
-        "stars": repo["stargazers_count"],
-        "language": repo.get("language", "不明"),
-        "ai_analysis": analysis,
+    headers = {
+        "Authorization": f"Basic {token}",
+        "Content-Type" : "application/json",
     }
 
+    payload = {
+        "title"  : generated["title"],
+        "content": generated["content"],
+        "status" : "draft",
+    }
 
-# ─────────────────────────────────────────────
-# Step 3: Chatwork 通知
-# ─────────────────────────────────────────────
+    endpoint = f"{WP_URL.rstrip('/')}/wp-json/wp/v2/posts"
 
-def build_message(news_list: list[dict], github_data: dict | None) -> str:
-    today = datetime.date.today().strftime("%Y年%m月%d日")
-    lines = [f"[info][title]📡 Tech Daily Digest｜{today}[/title]"]
-
-    # ── ニュースセクション ──
-    lines.append("[info][title]📰 技術ニュース要約（RSS）[/title]")
-    if news_list:
-        for i, item in enumerate(news_list, 1):
-            lines.append(f"[{i}] 【{item['source']}】 {item['title']}")
-            lines.append(item["link"])
-            lines.append(item["ai_summary"])
-            if i < len(news_list):
-                lines.append("[hr]")
-    else:
-        lines.append("（ニュースの取得に失敗しました）")
-    lines.append("[/info]")
-
-    # ── GitHub セクション ──
-    lines.append("[info][title]🌟 GitHub 注目リポジトリ（直近7日）[/title]")
-    if github_data:
-        lines.append(
-            f"⭐ {github_data['stars']:,} stars｜"
-            f"言語: {github_data['language']}｜"
-            f"{github_data['url']}"
-        )
-        lines.append(github_data["ai_analysis"])
-    else:
-        lines.append("（GitHubリポジトリの取得に失敗しました）")
-    lines.append("[/info]")
-
-    lines.append("[/info]")
-    return "\n".join(lines)
-
-
-def send_to_chatwork(message: str) -> bool:
-    url = f"https://api.chatwork.com/v2/rooms/{CHATWORK_ROOM_ID}/messages"
-    headers = {"X-ChatWorkToken": CHATWORK_API_TOKEN}
     try:
-        resp = requests.post(
-            url,
-            headers=headers,
-            data={"body": message},
-            timeout=15,
-        )
+        print(f"    [WP] POST → {endpoint}")
+        resp = requests.post(endpoint, json=payload, headers=headers, timeout=WP_TIMEOUT)
+        print(f"    [WP] HTTP status: {resp.status_code}")
         resp.raise_for_status()
-        print(f"[OK] Chatwork送信成功: message_id={resp.json().get('message_id')}")
+        data    = resp.json()
+        post_id = data.get("id", "不明")
+        link    = data.get("link", "")
+        print(f"    [WP] 下書き投稿成功 → ID: {post_id}  {link}")
         return True
-    except Exception as e:
-        print(f"[ERROR] Chatwork送信失敗: {e}")
+    except requests.exceptions.HTTPError as e:
+        print(f"    [WP] HTTPエラー: {e}")
+        print(f"    [WP] Response body: {resp.text[:500]}")
+        return False
+    except requests.exceptions.RequestException as e:
+        print(f"    [WP] リクエストエラー: {e}")
         return False
 
 
-# ─────────────────────────────────────────────
-# メインエントリポイント
-# ─────────────────────────────────────────────
+# ── メイン処理 ───────────────────────────────────────────────────────────────
+def main() -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print("=" * 54)
+    print(f"  福祉・介護ニュースダイジェスト  {now}")
+    print("=" * 54)
 
-def main():
-    print("=== DB初期化 ===")
+    # ── 起動時の設定確認（パスワード類は伏字）──────────────────
+    print("\n[CONFIG]")
+    print(f"  OLLAMA_NGROK_URL : {OLLAMA_NGROK_URL}")
+    print(f"  OLLAMA_MODEL     : {OLLAMA_MODEL}")
+    print(f"  WP_URL           : {WP_URL}")
+    print(f"  WP_USERNAME      : {WP_USERNAME}")
+    print(f"  WP_APP_PASSWORD  : {'SET' if WP_APP_PASSWORD else 'NOT SET'}")
+    print()
+
     init_db()
 
-    print("=== Step 1: RSS ニュース取得 & 要約 ===")
-    news_list = collect_news_summaries()
-    print(f"取得件数: {len(news_list)}")
+    total_posted = 0
+    total_skipped = 0
+    total_failed  = 0
 
-    print("=== Step 2: GitHub トレンド取得 & 解析 ===")
-    github_data = collect_github_analysis()
-    print(f"GitHub取得: {'成功' if github_data else '失敗'}")
+    for feed in RSS_FEEDS:
+        print(f"\n【{feed['name']}】")
+        articles = fetch_articles(feed)
 
-    print("=== Step 3: Chatwork 通知 ===")
-    message = build_message(news_list, github_data)
-    send_to_chatwork(message)
+        for article in articles:
+            print(f"  処理: {article['title'][:55]}...")
+
+            generated = generate_article(article)
+            if generated is None:
+                total_failed += 1
+                continue
+
+            success = post_to_wordpress(generated)
+            if success:
+                mark_sent(article["url"])
+                total_posted += 1
+            else:
+                total_failed += 1
+
+            time.sleep(2)  # API 負荷軽減
+
+    print("\n" + "=" * 54)
+    print(f"  投稿成功 : {total_posted} 件（WordPress 下書き）")
+    print(f"  スキップ : {total_skipped} 件（送信済み）")
+    print(f"  失敗     : {total_failed} 件")
+    print("=" * 54)
 
 
 if __name__ == "__main__":

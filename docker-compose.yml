@@ -1,8 +1,11 @@
 services:
-  tech-digest:
+  welfare-digest:
     build: .
+    container_name: welfare-digest
     env_file:
-      - .env
-    restart: "no"
+      - .env          # .env の値をコンテナ内の環境変数として渡す
+    restart: "no"     # 実行完了後にコンテナは自動終了（常駐しない）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # コンテナ→ホストPC への経路を保証
     volumes:
-      - ./output:/app/output
+      - ./output:/app/output   # SQLiteのDBファイルをホスト側に永続化

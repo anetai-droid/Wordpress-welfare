@@ -22,6 +22,21 @@ if %errorlevel% neq 0 (
 echo [INFO] Pulling Gemma model if not already downloaded...
 ollama pull gemma2:9b
 
+echo [INFO] Checking Docker status...
+docker info > nul 2>&1
+if %errorlevel% neq 0 (
+    echo [INFO] Starting Docker Desktop...
+    start "" "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+    echo [INFO] Waiting for Docker to be ready...
+    :wait_docker
+    timeout /t 5 /nobreak > nul
+    docker info > nul 2>&1
+    if %errorlevel% neq 0 goto wait_docker
+    echo [INFO] Docker is ready.
+) else (
+    echo [INFO] Docker is already running.
+)
+
 echo [INFO] Starting Docker container...
 docker compose up --build
 

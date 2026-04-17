@@ -30,7 +30,7 @@ WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
 
 DB_PATH = Path(__file__).parent / "output" / "history.db"
 
-MAX_ARTICLES_PER_FEED = 3   # 1フィードあたりの最大処理件数
+MAX_ARTICLES_PER_FEED = 1   # 1フィードあたりの最大処理件数
 AI_TIMEOUT            = 120  # Ollamaリクエストのタイムアウト（秒）
 WP_TIMEOUT            = 30   # WordPress APIのタイムアウト（秒）
 QUALITY_THRESHOLD     = 60   # この点数未満は下書き投稿しない（100点満点）

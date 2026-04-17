@@ -33,6 +33,7 @@ DB_PATH = Path(__file__).parent / "output" / "history.db"
 MAX_ARTICLES_PER_FEED = 3   # 1フィードあたりの最大処理件数
 AI_TIMEOUT            = 120  # Ollamaリクエストのタイムアウト（秒）
 WP_TIMEOUT            = 30   # WordPress APIのタイムアウト（秒）
+QUALITY_THRESHOLD     = 60   # この点数未満は下書き投稿しない（100点満点）
 
 # ── RSSフィード一覧（Google ニュース）──────────────────────────────────────
 RSS_FEEDS = [
@@ -210,6 +211,78 @@ def generate_article(article: dict) -> dict | None:
         return None
 
 
+# ── 品質チェック ─────────────────────────────────────────────────────────────
+
+QUALITY_CHECK_PROMPT = """あなたは福祉・介護業界の専門編集者です。
+以下のブログ記事を5つの評価基準でそれぞれ0〜20点で採点し、合計点と理由を出力してください。
+
+【評価基準】
+① 対象読者の一致（0〜20点）：福祉事業所の経営者・オーナー・管理者・スタッフが主な読者か。事業継続・経営判断に直結する内容か。
+② 制度・法令への関連性（0〜20点）：介護・障害福祉の報酬改定、義務化事項、運営指導、厚労省通知など制度面のトピックを扱うか。
+③ 実務的有用性（0〜20点）：BCP策定、地域連携推進会議、体制届、加算算定など現場で即活用できる情報・ノウハウが含まれるか。
+④ 協会活動との親和性（0〜20点）：研修・勉強会・作業会・セミナーといった協会が提供するイベント・支援サービスと連動する内容か。
+⑤ 障害・介護福祉の専門性（0〜20点）：グループホーム、生活介護、訪問看護など特定サービス種別の専門知識・事例を含む深みがあるか。
+
+必ず以下のフォーマットだけを出力してください（余計な文章は不要）：
+
+SCORE_1=<数値>
+SCORE_2=<数値>
+SCORE_3=<数値>
+SCORE_4=<数値>
+SCORE_5=<数値>
+TOTAL=<合計数値>
+REASON=<不合格の場合は改善点を1文、合格の場合は「合格」>
+"""
+
+
+def check_article_quality(generated: dict) -> tuple[int, str]:
+    """生成記事を5基準で採点し (合計点, 理由) を返す。API失敗時は (100, チェック不能) で通過"""
+    user_prompt = (
+        f"【記事タイトル】\n{generated['title']}\n\n"
+        f"【記事本文】\n{generated['content'][:3000]}"
+    )
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [
+            {"role": "system", "content": QUALITY_CHECK_PROMPT},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 256,
+        },
+    }
+
+    endpoint = f"{OLLAMA_NGROK_URL.rstrip('/')}/api/chat"
+
+    try:
+        print("    [CHECK] 品質チェック中...")
+        resp = requests.post(endpoint, json=payload, timeout=AI_TIMEOUT)
+        resp.raise_for_status()
+        raw = resp.json().get("message", {}).get("content", "").strip()
+
+        total  = 0
+        reason = "解析不能"
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("TOTAL="):
+                try:
+                    total = int(line.split("=", 1)[1].strip())
+                except ValueError:
+                    pass
+            elif line.startswith("REASON="):
+                reason = line.split("=", 1)[1].strip()
+
+        print(f"    [CHECK] スコア: {total}/100  理由: {reason}")
+        return total, reason
+
+    except requests.exceptions.RequestException as e:
+        print(f"    [CHECK] チェックエラー: {e} → 通過扱いにします")
+        return 100, "チェック不能のため通過"
+
+
 # ── WordPress 投稿 ───────────────────────────────────────────────────────────
 def post_to_wordpress(generated: dict) -> bool:
     """生成した記事をWordPressに「下書き」として投稿する"""
@@ -287,6 +360,13 @@ def main() -> None:
                 total_failed += 1
                 continue
 
+            score, reason = check_article_quality(generated)
+            if score < QUALITY_THRESHOLD:
+                print(f"    [CHECK] 不合格（{score}点 / 基準{QUALITY_THRESHOLD}点）→ 下書き投稿をスキップ")
+                print(f"    [CHECK] 改善点: {reason}")
+                total_skipped += 1
+                continue
+
             success = post_to_wordpress(generated)
             if success:
                 mark_sent(article["url"])
@@ -298,7 +378,7 @@ def main() -> None:
 
     print("\n" + "=" * 54)
     print(f"  投稿成功 : {total_posted} 件（WordPress 下書き）")
-    print(f"  スキップ : {total_skipped} 件（送信済み）")
+    print(f"  スキップ : {total_skipped} 件（品質基準{QUALITY_THRESHOLD}点未満）")
     print(f"  失敗     : {total_failed} 件")
     print("=" * 54)
 
